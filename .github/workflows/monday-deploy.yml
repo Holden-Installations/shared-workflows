@@ -4,7 +4,10 @@ name: Shared Monday Deployment
 on:
   workflow_call:
     inputs:
-      app_version_id:
+      app_id:
+        required: true
+        type: string
+      app_name:
         required: true
         type: string
     secrets:
@@ -53,11 +56,20 @@ jobs:
           JS
 
   deploy:
-    name: Deploy to monday.com
+    name: Deploy to monday.com Production
     needs: validate
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+
+    concurrency:
+      group: monday-production-${{ inputs.app_id }}
+      cancel-in-progress: false
+
+    env:
+      APP_ID: ${{ inputs.app_id }}
+      APP_NAME: ${{ inputs.app_name }}
+      NO_COLOR: '1'
 
     steps:
       - uses: actions/checkout@v4
@@ -67,7 +79,7 @@ jobs:
           node-version: '22'
 
       - name: Install monday CLI
-        run: npm install -g @mondaycom/apps-cli
+        run: npm install -g @mondaycom/apps-cli@4.11.2
 
       - name: Authenticate
         env:
@@ -76,15 +88,123 @@ jobs:
           test -n "$MONDAY_API_TOKEN"
           mapps init -t "$MONDAY_API_TOKEN"
 
+      - name: Verify application and resolve live version
+        run: |
+          mapps app:list > apps.txt
+          mapps app-version:list -i "$APP_ID" > versions.txt
+
+          node <<'JS'
+          const fs = require('fs');
+
+          function rows(file) {
+            return fs.readFileSync(file, 'utf8')
+              .split('\n')
+              .filter(line => line.includes('│'))
+              .map(line => line.split('│')
+                .slice(1, -1)
+                .map(v => v.trim().replace(/^['"]|['"]$/g, '')));
+          }
+
+          const id = process.env.APP_ID;
+          const name = process.env.APP_NAME;
+
+          if (!/^\d+$/.test(id)) {
+            throw new Error('Invalid application ID');
+          }
+
+          const apps = rows('apps.txt');
+          const app = apps.find(r => r[1] === id && r[2] === name);
+
+          if (!app) {
+            throw new Error('Application identity mismatch');
+          }
+
+          const versions = rows('versions.txt');
+          const live = versions.filter(r =>
+            r[2] === name &&
+            r[4] === id &&
+            r[5] === 'live'
+          );
+
+          if (live.length !== 1 || !/^\d+$/.test(live[0][1])) {
+            throw new Error('Unable to uniquely identify live version');
+          }
+
+          const version = live[0][1];
+
+          fs.appendFileSync(
+            process.env.GITHUB_ENV,
+            `APP_VERSION_ID=${version}\n`
+          );
+
+          console.log(`Verified application: ${name} (${id})`);
+          console.log(`Verified live version: ${version}`);
+          JS
+
+      - name: Verify application features
+        run: |
+          mapps app-features:list -a "$APP_ID" \
+            -i "$APP_VERSION_ID" > features.txt
+
+          cat features.txt
+
+          grep -q 'AppFeatureBoardView' features.txt || \
+          grep -q 'AppFeatureDashboardWidget' features.txt
+
+      - name: Back up existing production build
+        run: |
+          mkdir -p rollback
+
+          mapps app-version:builds \
+            -i "$APP_VERSION_ID" > rollback/builds.txt
+
+          SOURCE_URL=$(grep -oE \
+            'https://[^[:space:]]+/source/[0-9]+\.zip' \
+            rollback/builds.txt | head -n 1)
+
+          test -n "$SOURCE_URL"
+
+          curl --fail --silent --show-error --location \
+            "$SOURCE_URL" -o rollback/previous-build.zip
+
+          unzip -t rollback/previous-build.zip
+
+      - name: Retain rollback artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rollback-${{ inputs.app_id }}-${{ github.run_id }}
+          path: rollback/
+          retention-days: 30
+
       - name: Prepare deployment
         run: |
           mkdir -p dist
           cp index.html dist/index.html
 
-      - name: Deploy application
-        env:
-          APP_VERSION_ID: ${{ inputs.app_version_id }}
+      - name: Deploy to verified live version
         run: |
-          mapps code:push --client-side \
+          mapps code:push --client-side --force \
             -d "$GITHUB_WORKSPACE/dist" \
             -i "$APP_VERSION_ID"
+
+      - name: Verify deployment
+        run: |
+          mapps app-version:builds \
+            -i "$APP_VERSION_ID" > deployed-builds.txt
+
+          cat deployed-builds.txt
+
+          SOURCE_URL=$(grep -oE \
+            'https://[^[:space:]]+/source/[0-9]+\.zip' \
+            deployed-builds.txt | head -n 1)
+
+          test -n "$SOURCE_URL"
+
+          curl --fail --silent --show-error --location \
+            "$SOURCE_URL" -o deployed.zip
+
+          unzip -p deployed.zip index.html > deployed.html
+
+          cmp dist/index.html deployed.html
+
+          echo "Production deployment verified"
