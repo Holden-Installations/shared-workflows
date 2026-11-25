@@ -1,0 +1,90 @@
+
+name: Shared Monday Deployment
+
+on:
+  workflow_call:
+    inputs:
+      app_version_id:
+        required: true
+        type: string
+    secrets:
+      MONDAY_API_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate source code
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Validate HTML and JavaScript
+        run: |
+          node <<'JS'
+          const fs = require('fs');
+          const vm = require('vm');
+          const html = fs.readFileSync('index.html', 'utf8');
+
+          if (!/<html[\s>]/i.test(html) || !/<\/html>/i.test(html)) {
+            throw new Error('Invalid HTML document');
+          }
+
+          const scripts = [...html.matchAll(
+            /<script\b[^>]*>([\s\S]*?)<\/script>/gi
+          )];
+
+          scripts.forEach((script, i) => {
+            if (script[1].trim()) {
+              new vm.Script(script[1], {
+                filename: `script-${i}.js`
+              });
+            }
+          });
+
+          console.log('Source validation passed');
+          JS
+
+  deploy:
+    name: Deploy to monday.com
+    needs: validate
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install monday CLI
+        run: npm install -g @mondaycom/apps-cli
+
+      - name: Authenticate
+        env:
+          MONDAY_API_TOKEN: ${{ secrets.MONDAY_API_TOKEN }}
+        run: |
+          test -n "$MONDAY_API_TOKEN"
+          mapps init -t "$MONDAY_API_TOKEN"
+
+      - name: Prepare deployment
+        run: |
+          mkdir -p dist
+          cp index.html dist/index.html
+
+      - name: Deploy application
+        env:
+          APP_VERSION_ID: ${{ inputs.app_version_id }}
+        run: |
+          mapps code:push --client-side \
+            -d "$GITHUB_WORKSPACE/dist" \
+            -i "$APP_VERSION_ID"
