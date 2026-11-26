@@ -1,4 +1,3 @@
-
 name: Shared Monday Deployment
 
 on:
@@ -10,6 +9,14 @@ on:
       app_name:
         required: true
         type: string
+      multi_folder:
+        description: >
+          Deploy every committed file (root index.html plus subfolders),
+          for apps whose features load different paths. Default false keeps
+          the original single index.html behaviour.
+        required: false
+        type: boolean
+        default: false
     secrets:
       MONDAY_API_TOKEN:
         required: false
@@ -21,6 +28,9 @@ jobs:
   validate:
     name: Validate source code
     runs-on: ubuntu-latest
+
+    env:
+      MULTI_FOLDER: ${{ inputs.multi_folder }}
 
     steps:
       - uses: actions/checkout@v4
@@ -34,23 +44,40 @@ jobs:
           node <<'JS'
           const fs = require('fs');
           const vm = require('vm');
-          const html = fs.readFileSync('index.html', 'utf8');
+          const { execSync } = require('child_process');
 
-          if (!/<html[\s>]/i.test(html) || !/<\/html>/i.test(html)) {
-            throw new Error('Invalid HTML document');
+          // Single-file apps: just the root index.html (original behaviour).
+          // Multi-folder apps: every committed .html file outside .github.
+          const files = process.env.MULTI_FOLDER === 'true'
+            ? execSync("git ls-files -- '*.html' ':!:.github'")
+                .toString().split('\n').filter(Boolean)
+            : ['index.html'];
+
+          if (files.length === 0) {
+            throw new Error('No HTML files found to validate');
           }
 
-          const scripts = [...html.matchAll(
-            /<script\b[^>]*>([\s\S]*?)<\/script>/gi
-          )];
+          for (const file of files) {
+            const html = fs.readFileSync(file, 'utf8');
 
-          scripts.forEach((script, i) => {
-            if (script[1].trim()) {
-              new vm.Script(script[1], {
-                filename: `script-${i}.js`
-              });
+            if (!/<html[\s>]/i.test(html) || !/<\/html>/i.test(html)) {
+              throw new Error(`Invalid HTML document: ${file}`);
             }
-          });
+
+            const scripts = [...html.matchAll(
+              /<script\b[^>]*>([\s\S]*?)<\/script>/gi
+            )];
+
+            scripts.forEach((script, i) => {
+              if (script[1].trim()) {
+                new vm.Script(script[1], {
+                  filename: `${file}#script-${i}.js`
+                });
+              }
+            });
+
+            console.log(`Validated: ${file}`);
+          }
 
           console.log('Source validation passed');
           JS
@@ -69,6 +96,7 @@ jobs:
     env:
       APP_ID: ${{ inputs.app_id }}
       APP_NAME: ${{ inputs.app_name }}
+      MULTI_FOLDER: ${{ inputs.multi_folder }}
       NO_COLOR: '1'
 
     steps:
@@ -179,7 +207,17 @@ jobs:
       - name: Prepare deployment
         run: |
           mkdir -p dist
-          cp index.html dist/index.html
+
+          if [ "$MULTI_FOLDER" = "true" ]; then
+            # Only files committed to the repo, never the temporary files
+            # this run created (apps.txt, versions.txt, rollback/, ...).
+            git ls-files -z -- . ':!:.github' | xargs -0 -r cp --parents -t dist
+          else
+            cp index.html dist/index.html
+          fi
+
+          echo "Files to deploy:"
+          (cd dist && find . -type f | sort)
 
       - name: Deploy to verified live version
         run: |
@@ -203,8 +241,12 @@ jobs:
           curl --fail --silent --show-error --location \
             "$SOURCE_URL" -o deployed.zip
 
-          unzip -p deployed.zip index.html > deployed.html
+          unzip -q deployed.zip -d deployed
 
-          cmp dist/index.html deployed.html
+          # Every file we pushed must be present and identical in monday.
+          cd dist
+          find . -type f | while read -r f; do
+            cmp "$f" "../deployed/$f" || { echo "Mismatch or missing: $f"; exit 1; }
+          done
 
           echo "Production deployment verified"
